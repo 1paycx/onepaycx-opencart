@@ -1,0 +1,39 @@
+{{ header }}
+<div id="onepaycx-return" class="container">
+  <ul class="breadcrumb">
+    {% for breadcrumb in breadcrumbs %}
+      <li class="breadcrumb-item"><a href="{{ breadcrumb.href }}">{{ breadcrumb.text }}</a></li>
+    {% endfor %}
+  </ul>
+  <div class="row">{{ column_left }}
+    <div id="content" class="col">{{ content_top }}
+      <h1>{{ heading_title }}</h1>
+      {% if state == 'pending' %}
+        <div class="alert alert-info">
+          <div class="spinner-border spinner-border-sm me-2" role="status"></div>
+          {{ text_return_pending }}
+        </div>
+        <p>{{ text_return_pending_hint }}</p>
+        <div class="text-end"><a href="{{ refresh }}" class="btn btn-primary">{{ button_refresh }}</a></div>
+      {% elseif state == 'failed' %}
+        <div class="alert alert-danger">{{ text_return_failed }}</div>
+        <div class="text-end"><a href="{{ retry }}" class="btn btn-primary">{{ button_retry }}</a></div>
+      {% elseif state == 'expired' %}
+        <div class="alert alert-warning">{{ text_return_expired }}</div>
+        <div class="text-end"><a href="{{ retry }}" class="btn btn-primary">{{ button_retry }}</a></div>
+      {% else %}
+        <div class="alert alert-warning">{{ text_return_error }}</div>
+        <div class="text-end"><a href="{{ refresh }}" class="btn btn-primary">{{ button_refresh }}</a></div>
+      {% endif %}
+      {{ content_bottom }}</div>
+    {{ column_right }}</div>
+</div>
+{% if refresh_seconds %}
+  <noscript><meta http-equiv="refresh" content="{{ refresh_seconds }};url={{ refresh }}"></noscript>
+  <script type="text/javascript"><!--
+  setTimeout(function () {
+      location.replace('{{ refresh }}');
+  }, {{ refresh_seconds }} * 1000);
+  //--></script>
+{% endif %}
+{{ footer }}
