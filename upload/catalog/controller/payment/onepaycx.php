@@ -149,13 +149,20 @@ class Onepaycx extends \Opencart\System\Engine\Controller {
 	}
 
 	/**
-	 * Signed notify from 1pay.cx: { event, data, at } with X-1pay-Signature =
-	 * hex HMAC-SHA256 of the RAW body under the merchant's webhook secret.
-	 * Only a verified "payment.paid" event touches an order. The row is claimed
-	 * atomically, so a repeat (or a concurrent return-page poll) answers 200
-	 * without doing anything. 1pay.cx sends the notify exactly once and does
-	 * not retry on a non-2xx answer: anything that fails here is finished by
-	 * return() when the buyer comes back, or by reconcile() from a cron job.
+	 * Signed notify from 1pay.cx: { event, data, at }. Signed with
+	 * X-1pay-Signature-V2 ("t=<unix>,v1=<hex HMAC-SHA256 of '<t>.<raw body>'>",
+	 * timestamp within 5 minutes) or, from older senders, X-1pay-Signature (hex
+	 * HMAC-SHA256 of the raw body). When the V2 header is present it alone decides.
+	 *
+	 * A verified "payment.paid" event only touches an order after every check:
+	 * - the payment id is one this store created for that order (local row);
+	 * - the notify's amount/currency cover the quoted amount (surcharge on top is fine);
+	 * - a test payment (livemode:false) is refused while a live key is configured;
+	 * - GET /v1/payments/{id} with the configured key confirms status "paid" with
+	 *   a matching amount/currency and mode.
+	 * Any failed check refuses without marking anything; return() or reconcile()
+	 * completes a genuine payment later. The row is claimed atomically, so a
+	 * repeat (or a concurrent return-page poll) answers 200 without doing anything.
 	 */
 	public function callback(): void {
 		$this->loadLanguage();
@@ -163,7 +170,9 @@ class Onepaycx extends \Opencart\System\Engine\Controller {
 		$raw = $this->rawBody();
 		$server = $this->request->server;
 		$signature = isset($server['HTTP_X_1PAY_SIGNATURE']) ? (string)$server['HTTP_X_1PAY_SIGNATURE'] : '';
+		$signature_v2 = isset($server['HTTP_X_1PAY_SIGNATURE_V2']) ? (string)$server['HTTP_X_1PAY_SIGNATURE_V2'] : '';
 		$secret = (string)$this->config->get('payment_onepaycx_webhook_secret');
+		$api_key = (string)$this->config->get('payment_onepaycx_api_key');
 
 		if (!$this->config->get('payment_onepaycx_status')) {
 			// The notify is not redelivered; reconcile() picks the payment up once re-enabled.
@@ -172,13 +181,13 @@ class Onepaycx extends \Opencart\System\Engine\Controller {
 			return;
 		}
 
-		if ($secret === '' || $signature === '' || $raw === '') {
+		if ($secret === '' || ($signature === '' && $signature_v2 === '') || $raw === '') {
 			$this->respond(400, 'missing signature');
 
 			return;
 		}
 
-		if (!Api::verifySignature($raw, $signature, $secret)) {
+		if (!Api::verifyWebhook($raw, $signature_v2, $signature, $secret, $this->now())) {
 			$this->respond(401, 'bad signature');
 
 			return;
@@ -210,6 +219,15 @@ class Onepaycx extends \Opencart\System\Engine\Controller {
 			return;
 		}
 
+		// A test payment must never complete an order in a live store.
+		$live_key = !Api::isTestKey($api_key);
+
+		if ($live_key && array_key_exists('livemode', $data) && $data['livemode'] === false) {
+			$this->respond(400, 'test payment');
+
+			return;
+		}
+
 		$this->load->model(self::ROUTE);
 
 		// Only honour notifies for a payment this store actually started for this order.
@@ -221,7 +239,55 @@ class Onepaycx extends \Opencart\System\Engine\Controller {
 			return;
 		}
 
-		$paid_amount = (isset($data['amount']) && is_numeric($data['amount'])) ? Api::formatAmount($data['amount']) : null;
+		if ((string)$row['status'] === 'paid') {
+			$this->respond(200, 'already paid');
+
+			return;
+		}
+
+		if (!Api::coversQuote($data['amount'] ?? null, $data['currency'] ?? null, (string)$row['amount'], (string)$row['currency'])) {
+			$this->respond(400, 'amount mismatch');
+
+			return;
+		}
+
+		// Trust, but verify: ask 1pay.cx directly with this store's own key.
+		if ($api_key === '') {
+			$this->respond(503, 'not configured');
+
+			return;
+		}
+
+		$res = $this->api($api_key)->getPayment($payment_id);
+
+		if (!$res['ok'] || !is_array($res['data'])) {
+			// Transient; return() or reconcile() finishes the order later.
+			$this->respond(503, 'verification unavailable');
+
+			return;
+		}
+
+		$remote = $res['data'];
+
+		if ((string)($remote['status'] ?? '') !== 'paid') {
+			$this->respond(409, 'not paid');
+
+			return;
+		}
+
+		if (!Api::coversQuote($remote['amount'] ?? null, $remote['currency'] ?? null, (string)$row['amount'], (string)$row['currency'])) {
+			$this->respond(400, 'amount mismatch');
+
+			return;
+		}
+
+		if ($live_key && array_key_exists('livemode', $remote) && $remote['livemode'] === false) {
+			$this->respond(400, 'test payment');
+
+			return;
+		}
+
+		$paid_amount = Api::formatAmount($remote['amount']);
 
 		switch ($this->completeOrder($row, 'webhook', $paid_amount)) {
 			case 'ok':
@@ -602,7 +668,7 @@ class Onepaycx extends \Opencart\System\Engine\Controller {
 	 * Plain-text response with an HTTP status; the notify sender only looks at the status.
 	 */
 	protected function respond(int $status, string $text): void {
-		$reasons = [200 => 'OK', 400 => 'Bad Request', 401 => 'Unauthorized', 404 => 'Not Found', 500 => 'Internal Server Error', 503 => 'Service Unavailable'];
+		$reasons = [200 => 'OK', 400 => 'Bad Request', 401 => 'Unauthorized', 404 => 'Not Found', 409 => 'Conflict', 500 => 'Internal Server Error', 503 => 'Service Unavailable'];
 		$protocol = isset($this->request->server['SERVER_PROTOCOL']) && is_string($this->request->server['SERVER_PROTOCOL'])
 			? $this->request->server['SERVER_PROTOCOL']
 			: 'HTTP/1.1';
@@ -616,6 +682,11 @@ class Onepaycx extends \Opencart\System\Engine\Controller {
 	/** The raw request body — the signature is computed over these exact bytes. */
 	protected function rawBody(): string {
 		return (string)file_get_contents('php://input');
+	}
+
+	/** Current unix time (overridable by the compile harness). */
+	protected function now(): int {
+		return time();
 	}
 
 	/** Factory so the compile harness can substitute a fake client. */

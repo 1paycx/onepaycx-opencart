@@ -19,10 +19,10 @@
 namespace Opencart\System\Library\Extension\Onepaycx;
 
 class Api {
-	public const VERSION = '1.0.0';
+	public const VERSION = '1.1.0';
 	public const API_BASE = 'https://api.1pay.cx';
 	public const CHECKOUT_BASE = 'https://1pay.cx';
-	public const USER_AGENT = 'onepaycx-opencart/1.0.0';
+	public const USER_AGENT = 'onepaycx-opencart/1.1.0';
 
 	/** @var string the merchant's API key (pk_xxx.yyy) */
 	private string $key;
@@ -113,6 +113,84 @@ class Api {
 		$expected = hash_hmac('sha256', $rawBody, $secret);
 
 		return hash_equals($expected, $signature);
+	}
+
+	/** Maximum age (either direction) of a timestamped X-1pay-Signature-V2, in seconds. */
+	public const SIGNATURE_TOLERANCE = 300;
+
+	/**
+	 * Constant-time check of X-1pay-Signature-V2: "t=<unix>,v1=<hex>" where v1 is
+	 * the hex HMAC-SHA256 of "<t>.<raw body>". The timestamp must be within
+	 * SIGNATURE_TOLERANCE seconds of $now, so a captured notify cannot be replayed later.
+	 */
+	public static function verifySignatureV2(string $rawBody, string $header, string $secret, ?int $now = null): bool {
+		if ($secret === '') {
+			return false;
+		}
+		$t = null;
+		$v1 = [];
+		foreach (explode(',', $header) as $part) {
+			$kv = explode('=', trim($part), 2);
+			if (count($kv) !== 2) {
+				continue;
+			}
+			if ($kv[0] === 't' && preg_match('/^[0-9]{1,12}$/', $kv[1])) {
+				$t = (int)$kv[1];
+			} elseif ($kv[0] === 'v1') {
+				$v1[] = strtolower($kv[1]);
+			}
+		}
+		if ($t === null || !$v1) {
+			return false;
+		}
+		if (abs(($now ?? time()) - $t) > self::SIGNATURE_TOLERANCE) {
+			return false;
+		}
+		$expected = hash_hmac('sha256', $t . '.' . $rawBody, $secret);
+		$ok = false;
+		foreach ($v1 as $candidate) {
+			if (preg_match('/^[0-9a-f]{64}$/', $candidate) && hash_equals($expected, $candidate)) {
+				$ok = true;
+			}
+		}
+
+		return $ok;
+	}
+
+	/**
+	 * Verify a notify: the timestamped V2 header when present (it then decides
+	 * alone, no fallback), otherwise the legacy body-only signature.
+	 */
+	public static function verifyWebhook(string $rawBody, string $v2Header, string $legacyHeader, string $secret, ?int $now = null): bool {
+		if (trim($v2Header) !== '') {
+			return self::verifySignatureV2($rawBody, $v2Header, $secret, $now);
+		}
+
+		return $legacyHeader !== '' && self::verifySignature($rawBody, $legacyHeader, $secret);
+	}
+
+	/** Test keys are pk_test_...; everything else is a live key. */
+	public static function isTestKey(string $key): bool {
+		return strpos($key, 'pk_test_') === 0;
+	}
+
+	/**
+	 * Whether a reported payment amount/currency covers what was quoted.
+	 * Currency must match exactly; the amount may be higher (the merchant's
+	 * optional customer surcharge) but not lower than quoted minus 0.01.
+	 *
+	 * @param mixed $amount   reported amount
+	 * @param mixed $currency reported currency
+	 */
+	public static function coversQuote($amount, $currency, string $quotedAmount, string $quotedCurrency): bool {
+		if (!is_numeric($amount) || !is_string($currency)) {
+			return false;
+		}
+		if (strtoupper($currency) !== strtoupper($quotedCurrency)) {
+			return false;
+		}
+
+		return (int)round((float)$amount * 100) >= (int)round((float)$quotedAmount * 100) - 1;
 	}
 
 	/**

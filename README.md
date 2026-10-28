@@ -1,6 +1,6 @@
 # 1pay.cx for OpenCart 4
 
-Accept card, Bitcoin and Monero payments in OpenCart 4.0.x with [1pay.cx](https://1pay.cx).
+Accept card and crypto payments in OpenCart 4.0.x with [1pay.cx](https://1pay.cx).
 "Pay by card or crypto" on the confirm step, the buyer pays on the hosted checkout, the
 order is confirmed by a signed webhook. Card sales settle to you in USDC on Polygon, crypto at
 a flat 1%. No KYB, no rolling reserves, no chargebacks.

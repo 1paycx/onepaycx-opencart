@@ -1,7 +1,7 @@
-# Development notes
+# plugins/opencart
 
 OpenCart 4 payment extension for 1pay.cx: "Pay by card or crypto" at checkout, buyer pays on
-the hosted checkout, the order is confirmed by a signed webhook. Version 1.0.0, MIT licence.
+the hosted checkout, the order is confirmed by a signed webhook. Version 1.1.0, MIT licence.
 
 ```
 upload/            the extension exactly as it is zipped (see "Layout")
@@ -20,6 +20,15 @@ test/              stub-parent compile harness - run before every release
 build.sh           lints, runs the harness, zips upload/ + LICENSE into onepaycx.ocmod.zip
 LICENSE            MIT (ships at the archive root)
 ```
+
+## Webhook setup
+
+This plugin supplies `notifyUrl` for each payment and obtains the account's signing secret
+from `GET /v1/me` for the configured API key's mode. No registered webhook endpoint is
+required. Payments with `notifyUrl` send their events only to that callback; registered
+endpoints are skipped for those payments and can remain saved for other integrations. To verify order updates, create a test order
+with a test API key and simulate payment; the registered-endpoint test button does not
+exercise this callback flow.
 
 ## Layout chosen (be precise when changing it)
 
@@ -79,9 +88,9 @@ features (`mixed`, `str_starts_with`).
    `payment.paid` for a payment this store created for that order is acted on. The payment
    row is claimed atomically (`UPDATE ... WHERE status <> 'paid'`) so a repeat or a
    concurrent return-page poll answers `200 already paid` without adding history. If the
-   order update fails the claim is released and `500` is answered - but **1pay.cx sends the
-   notify exactly once and does not retry** (`packages/api/src/webhooks.ts` `deliverNotify()`
-   is a single best-effort POST); the order is then finished by step 4 or step 5.
+   order update fails the claim is released and `500` is answered. Failed notifications retry
+   after 1 minute, 5 minutes, 30 minutes, 2 hours and 6 hours (six attempts total).
+   The buyer return and reconciliation paths in steps 4 and 5 provide additional recovery.
    Before the paid status is applied the payment is checked against the order **as it is
    now**: OpenCart edits an unpaid order in place (`checkout/confirm` calls `editOrder()`
    while the status is 0), so a buyer can open a $1 link, grow the cart to $500, re-confirm
@@ -131,6 +140,7 @@ table by hand if you want it gone.
 ## Checks (must pass before a release)
 
 ```bash
+cd plugins/opencart
 for f in $(find . -name '*.php'); do php -l "$f" >/dev/null || echo "LINT FAIL $f"; done
 php test/compile-check.php
 ```
@@ -151,7 +161,7 @@ only the members the extension calls; calling a new OpenCart API means adding it
 ## Packaging
 
 ```bash
-./build.sh            # -> onepaycx.ocmod.zip
+plugins/opencart/build.sh            # -> plugins/opencart/onepaycx.ocmod.zip
 ```
 
 ## Contract this extension relies on
@@ -160,10 +170,29 @@ only the members the extension calls; calling a new OpenCart API means adding it
   `https://1pay.cx`. `amount` is a JSON number rounded to two decimals (the API schema is
   `z.number()`), `currency` an upper-case ISO code, `reference` the order id.
 - `GET /v1/payments/{id}` -> `status` in `pending | paid | failed | expired`.
-- `GET /v1/me` -> `{ id, email, webhookSecret }`.
+- `GET /v1/me` -> `{ id, webhookSecret, livemode }`; the secret is the one for the key's mode
+  (a `pk_test_` key gets the test secret, which signs test payments).
 - Notify: `POST notifyUrl` with `{ event, data, at }`; `data` carries `paymentId`,
-  `reference`, `amount`, `status`; `X-1pay-Signature` is the hex HMAC-SHA256 of the raw body
-  under `webhookSecret`. Only `payment.paid` is acted on. It is sent **once** per payment
-  (no retry on a non-2xx answer), and `data.amount` is the amount the buyer was charged: what the extension sent plus the merchant's optional customer surcharge (set in the 1pay.cx dashboard), so it can exceed the order total. The extension treats any reported amount at or above the order amount as paid and flags only underpayment or a currency change as a mismatch.
-- User-Agent `onepaycx-opencart/1.0.0` (the API's `viaFromUserAgent` does not yet map it to
-  a platform name; it records `api` until that is added server-side).
+  `reference`, `amount`, `currency`, `status`, `livemode`. `X-1pay-Signature-V2:
+  t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">` is verified when present (and must be within
+  300 s of the store's clock); otherwise the legacy `X-1pay-Signature` (hex HMAC-SHA256 of the raw
+  body) is accepted. Only `payment.paid` is acted on, and only after: the payment id matches a
+  row this store created for that order; the notify's amount/currency cover the stored quote
+  (0.01 tolerance); a `livemode:false` payment is refused under a live key; and
+  `GET /v1/payments/{id}` with the store's key confirms `paid` with a matching amount/currency.
+  Any failed check answers non-2xx without touching the order. Failed deliveries are retried
+  up to six total attempts, so handlers must tolerate repeated events. `data.amount` is the amount the buyer was charged: what the extension sent plus the merchant's optional customer surcharge (set in the 1pay.cx dashboard), so it can exceed the order total. The extension treats any reported amount at or above the order amount as paid and flags only underpayment or a currency change as a mismatch.
+- User-Agent `onepaycx-opencart/<version>`; the API's `viaFromUserAgent` records payments it
+  creates with `created_via = 'opencart'`.
+
+## Changelog
+
+### 1.1.0
+
+- Webhook hardening: timestamped `X-1pay-Signature-V2` (5-minute window) with legacy fallback,
+  notify amount/currency must match the stored quote, test payments refused under a live key,
+  and every paid notify is re-confirmed with `GET /v1/payments/{id}` before the order moves.
+
+### 1.0.0
+
+- Initial release.

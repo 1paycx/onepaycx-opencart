@@ -102,7 +102,7 @@ echo "2. API client helpers\n";
 /* ------------------------------------------------------------------ */
 
 $secret = 'whsec_test';
-$raw = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'k3Xm9Qp2', 'reference' => '7', 'amount' => 12.5, 'valueForwarded' => 12.5, 'status' => 'paid'], 'at' => '2026-09-08T00:00:00.000Z']);
+$raw = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'k3Xm9Qp2', 'reference' => '7', 'amount' => 12.5, 'valueForwarded' => 12.5, 'status' => 'paid', 'currency' => 'USD', 'livemode' => true], 'at' => '2026-09-08T00:00:00.000Z']);
 $sig = hash_hmac('sha256', $raw, $secret);
 check('valid signature accepted', Api::verifySignature($raw, $sig, $secret));
 check('upper-case hex accepted', Api::verifySignature($raw, strtoupper($sig), $secret));
@@ -155,10 +155,19 @@ class FakeApi extends Api {
 		return ['ok' => true, 'status' => 200, 'data' => self::$payment, 'error' => ''];
 	}
 
+	/** @var array<string,float> per-payment amount overrides */
+	public static array $amountById = [];
+	public static string $currency = 'USD';
+	public static bool $livemode = true;
+	public static bool $getOk = true;
+
 	public function getPayment(string $id): array {
 		self::$calls[] = 'get:' . $id;
+		if (!self::$getOk) {
+			return ['ok' => false, 'status' => 0, 'data' => null, 'error' => 'network_error'];
+		}
 
-		return ['ok' => true, 'status' => 200, 'data' => ['id' => $id, 'status' => self::$statusById[$id] ?? self::$status, 'amount' => self::$amount, 'currency' => 'USD'], 'error' => ''];
+		return ['ok' => true, 'status' => 200, 'data' => ['id' => $id, 'status' => self::$statusById[$id] ?? self::$status, 'amount' => self::$amountById[$id] ?? self::$amount, 'currency' => self::$currency, 'livemode' => self::$livemode], 'error' => ''];
 	}
 }
 
@@ -584,9 +593,12 @@ FakeApi::$payment = ['id' => 'k3Xm9Qp2', 'checkoutUrl' => '/pay/k3Xm9Qp2'];
 echo "6. Catalog controller: callback\n";
 /* ------------------------------------------------------------------ */
 
-function webhook(TestCatalogController $cat, Registry $c, string $body, string $sig): Response {
+function webhook(TestCatalogController $cat, Registry $c, string $body, string $sig, string $sigV2 = ''): Response {
 	$c->response->reset();
 	$c->request->server = ['SERVER_PROTOCOL' => 'HTTP/1.1', 'HTTP_X_1PAY_SIGNATURE' => $sig];
+	if ($sigV2 !== '') {
+		$c->request->server['HTTP_X_1PAY_SIGNATURE_V2'] = $sigV2;
+	}
 	$cat->body = $body;
 	$cat->callback();
 
@@ -598,6 +610,9 @@ function webhook(TestCatalogController $cat, Registry $c, string $body, string $
 $c->session->data['order_id'] = 7;
 confirm($cat, $c);
 $orders->history = [];
+// The callback re-fetches GET /v1/payments/{id}; by default it confirms "paid".
+FakeApi::$status = 'paid';
+FakeApi::$amountById = ['pA' => 1.0, 'pB' => 500.0];
 $orders->orders[7]['order_status_id'] = 0;
 check('fixture: k3Xm9Qp2 belongs to order 7 and is pending', $store->getPayment('k3Xm9Qp2')['order_id'] === 7 && $store->getPayment('k3Xm9Qp2')['status'] === 'pending');
 
@@ -617,15 +632,15 @@ $other = json_encode(['event' => 'card.issued', 'data' => [], 'at' => 'x']);
 $r = webhook($cat, $c, $other, hash_hmac('sha256', $other, $secret));
 check('other events acknowledged and ignored -> 200', $r->status() === 200 && $r->getOutput() === 'ignored' && $orders->history === []);
 
-$unknown = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'zzz', 'reference' => '7', 'amount' => 12.5, 'status' => 'paid'], 'at' => 'x']);
+$unknown = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'zzz', 'reference' => '7', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $unknown, hash_hmac('sha256', $unknown, $secret));
 check('paid event for a payment this store did not create -> 404', $r->status() === 404 && $orders->history === []);
 
-$wrongOrder = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'k3Xm9Qp2', 'reference' => '8', 'amount' => 12.5, 'status' => 'paid'], 'at' => 'x']);
+$wrongOrder = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'k3Xm9Qp2', 'reference' => '8', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $wrongOrder, hash_hmac('sha256', $wrongOrder, $secret));
 check('paid event whose reference does not match the payment\'s order -> 404', $r->status() === 404 && $orders->history === []);
 
-$badRef = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'k3Xm9Qp2', 'reference' => 'abc', 'status' => 'paid'], 'at' => 'x']);
+$badRef = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'k3Xm9Qp2', 'reference' => 'abc', 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $badRef, hash_hmac('sha256', $badRef, $secret));
 check('non-numeric reference -> 400', $r->status() === 400);
 
@@ -643,15 +658,72 @@ check('payment row marked paid', $store->getPayment('k3Xm9Qp2')['status'] === 'p
 $r = webhook($cat, $c, $raw, $sig);
 check('redelivery is idempotent -> 200 already paid, no second addHistory', $r->status() === 200 && $r->getOutput() === 'already paid' && count($orders->history) === 1);
 
-// The amount 1pay.cx reports differs from what the link was created for:
-// the row is claimed, the order gets a WARNING note, but NOT the paid status.
+// The amount the notify reports is below what the link was created for:
+// refused outright, nothing claimed, no history.
 $store->addPayment('p2', 7, '12.50', 'USD', str_repeat('c', 32));
 $store->rows['p2']['seq'] = 99;
 $orders->orders[7]['order_status_id'] = 0;
-$mismatch = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'p2', 'reference' => '7', 'amount' => 11, 'status' => 'paid'], 'at' => 'x']);
+$mismatch = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'p2', 'reference' => '7', 'amount' => 11, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $mismatch, hash_hmac('sha256', $mismatch, $secret));
-check('reported-amount mismatch -> 200, WARNING note, order made visible but NOT moved to the paid status', $r->status() === 200 && count($orders->history) === 2 && $orders->history[1]['order_status_id'] === 1
-	&& str_contains($orders->history[1]['comment'], 'WARNING') && str_contains($orders->history[1]['comment'], '11.00 USD') && str_contains($orders->history[1]['comment'], '12.50 USD') && $orders->orders[7]['order_status_id'] !== 2 && $store->getPayment('p2')['status'] === 'paid');
+check('reported-amount below the quote -> 400, nothing claimed, no history', $r->status() === 400 && $r->getOutput() === 'amount mismatch' && count($orders->history) === 1 && $store->getPayment('p2')['status'] === 'pending');
+$within = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'p2', 'reference' => '7', 'amount' => 12.49, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
+FakeApi::$amountById['p2'] = 5.0;
+$r = webhook($cat, $c, $within, hash_hmac('sha256', $within, $secret));
+check('notify within 0.01 but the API re-fetch reports less -> 400, nothing claimed', $r->status() === 400 && $store->getPayment('p2')['status'] === 'pending' && count($orders->history) === 1);
+unset(FakeApi::$amountById['p2']);
+$noCur = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'p2', 'reference' => '7', 'amount' => 12.5, 'status' => 'paid'], 'at' => 'x']);
+$r = webhook($cat, $c, $noCur, hash_hmac('sha256', $noCur, $secret));
+check('notify without a currency -> 400', $r->status() === 400 && $store->getPayment('p2')['status'] === 'pending');
+$eur = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'p2', 'reference' => '7', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'EUR'], 'at' => 'x']);
+$r = webhook($cat, $c, $eur, hash_hmac('sha256', $eur, $secret));
+check('notify in another currency -> 400', $r->status() === 400 && $store->getPayment('p2')['status'] === 'pending');
+$p2 = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'p2', 'reference' => '7', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
+FakeApi::$statusById['p2'] = 'pending';
+$r = webhook($cat, $c, $p2, hash_hmac('sha256', $p2, $secret));
+check('signed notify but the API says not paid -> 409, nothing claimed', $r->status() === 409 && $store->getPayment('p2')['status'] === 'pending' && count($orders->history) === 1);
+unset(FakeApi::$statusById['p2']);
+FakeApi::$getOk = false;
+$r = webhook($cat, $c, $p2, hash_hmac('sha256', $p2, $secret));
+check('API re-fetch unavailable -> 503, nothing claimed', $r->status() === 503 && $store->getPayment('p2')['status'] === 'pending');
+FakeApi::$getOk = true;
+FakeApi::$currency = 'EUR';
+$r = webhook($cat, $c, $p2, hash_hmac('sha256', $p2, $secret));
+check('API re-fetch in another currency -> 400', $r->status() === 400 && $store->getPayment('p2')['status'] === 'pending');
+FakeApi::$currency = 'USD';
+
+// Test payments vs a live key.
+$c->config->set('payment_onepaycx_api_key', 'pk_live1.secret');
+$testPay = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'p2', 'reference' => '7', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD', 'livemode' => false], 'at' => 'x']);
+$r = webhook($cat, $c, $testPay, hash_hmac('sha256', $testPay, $secret));
+check('livemode:false notify with a live key -> 400 test payment', $r->status() === 400 && $r->getOutput() === 'test payment' && $store->getPayment('p2')['status'] === 'pending');
+FakeApi::$livemode = false;
+$r = webhook($cat, $c, $p2, hash_hmac('sha256', $p2, $secret));
+check('live key, API re-fetch says livemode:false -> 400', $r->status() === 400 && $store->getPayment('p2')['status'] === 'pending');
+$c->config->set('payment_onepaycx_api_key', 'pk_test_abc.secret');
+$r = webhook($cat, $c, $testPay, hash_hmac('sha256', $testPay, $secret));
+check('livemode:false notify with a pk_test_ key -> accepted', $r->status() === 200 && $store->getPayment('p2')['status'] === 'paid');
+FakeApi::$livemode = true;
+$c->config->set('payment_onepaycx_api_key', 'pk_test.secret');
+
+// Timestamped V2 signature.
+$store->addPayment('pV', 7, '12.50', 'USD', str_repeat('v', 32));
+$store->rows['pV']['seq'] = 98;
+$pV = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pV', 'reference' => '7', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
+$now = time();
+$v2 = fn (string $body, int $t, string $key = 'whsec_test') => 't=' . $t . ',v1=' . hash_hmac('sha256', $t . '.' . $body, $key);
+check('verifySignatureV2 accepts a fresh signature and rejects stale/future/tampered/wrong-secret ones',
+	Api::verifySignatureV2($pV, $v2($pV, $now), $secret, $now)
+	&& !Api::verifySignatureV2($pV, $v2($pV, $now - 301), $secret, $now)
+	&& !Api::verifySignatureV2($pV, $v2($pV, $now + 301), $secret, $now)
+	&& !Api::verifySignatureV2($pV . ' ', $v2($pV, $now), $secret, $now)
+	&& !Api::verifySignatureV2($pV, $v2($pV, $now, 'other'), $secret, $now)
+	&& !Api::verifySignatureV2($pV, 'v1=' . hash_hmac('sha256', $pV, $secret), $secret, $now));
+$r = webhook($cat, $c, $pV, hash_hmac('sha256', $pV, $secret), $v2($pV, $now - 400));
+check('stale V2 signature -> 401 even with a valid legacy header (V2 decides alone)', $r->status() === 401 && $store->getPayment('pV')['status'] === 'pending');
+$r = webhook($cat, $c, $pV, '', 't=' . $now . ',v1=' . str_repeat('0', 64));
+check('bad V2 signature -> 401', $r->status() === 401);
+$r = webhook($cat, $c, $pV, '', $v2($pV, $now));
+check('fresh V2 signature alone -> 200 ok', $r->status() === 200 && $r->getOutput() === 'already paid' && $store->getPayment('pV')['status'] === 'paid');
 
 // Edited order: link A created for a $1.00 cart, buyer goes back, grows the cart to $500,
 // re-confirms (OpenCart edits order 20 in place; a second link B is created) and pays A.
@@ -661,14 +733,14 @@ $store->rows['pA']['seq'] = 200;
 $store->addPayment('pB', 20, '500.00', 'USD', str_repeat('f', 32));
 $store->rows['pB']['seq'] = 201;
 $before = count($orders->history);
-$pA = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pA', 'reference' => '20', 'amount' => 1, 'status' => 'paid'], 'at' => 'x']);
+$pA = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pA', 'reference' => '20', 'amount' => 1, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $pA, hash_hmac('sha256', $pA, $secret));
 check('paying the stale $1.00 link for a now-$500.00 order -> 200, row claimed, order NOT moved to the paid status', $r->status() === 200 && $r->getOutput() === 'ok' && $store->getPayment('pA')['status'] === 'paid'
 	&& $orders->orders[20]['order_status_id'] !== 2 && count($orders->history) === $before + 1);
 check('...the note names the amount paid and the current order total', end($orders->history)['order_status_id'] === 1 && str_contains(end($orders->history)['comment'], 'WARNING') && str_contains(end($orders->history)['comment'], '1.00 USD') && str_contains(end($orders->history)['comment'], '500.00 USD'));
 $r = webhook($cat, $c, $pA, hash_hmac('sha256', $pA, $secret));
 check('...and a repeat of that notify is still idempotent', $r->getOutput() === 'already paid' && count($orders->history) === $before + 1);
-$pB = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pB', 'reference' => '20', 'amount' => 500, 'status' => 'paid'], 'at' => 'x']);
+$pB = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pB', 'reference' => '20', 'amount' => 500, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $pB, hash_hmac('sha256', $pB, $secret));
 check('the matching $500.00 link moves the order to the paid status', $r->getOutput() === 'ok' && $orders->orders[20]['order_status_id'] === 2 && !str_contains(end($orders->history)['comment'], 'WARNING'));
 
@@ -676,7 +748,7 @@ check('the matching $500.00 link moves the order to the paid status', $r->getOut
 $orders->orders[21] = ['order_id' => 21, 'order_status_id' => 1, 'total' => 12.5, 'currency_code' => 'EUR', 'currency_value' => 0.9, 'email' => ''];
 $store->addPayment('pC', 21, '12.50', 'USD', str_repeat('g', 32));
 $store->rows['pC']['seq'] = 202;
-$pC = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pC', 'reference' => '21', 'amount' => 12.5, 'status' => 'paid'], 'at' => 'x']);
+$pC = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pC', 'reference' => '21', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $pC, hash_hmac('sha256', $pC, $secret));
 check('currency mismatch -> WARNING note on the current status, not the paid status', $r->status() === 200 && $orders->orders[21]['order_status_id'] === 1 && str_contains(end($orders->history)['comment'], '11.25 EUR'));
 
@@ -688,25 +760,25 @@ $store->rows['pOld']['seq'] = 203;
 $store->setStatus('pOld', 'expired');
 $store->addPayment('pNew', 22, '12.50', 'USD', str_repeat('i', 32));
 $store->rows['pNew']['seq'] = 204;
-$pNew = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pNew', 'reference' => '22', 'amount' => 12.5, 'status' => 'paid'], 'at' => 'x']);
+$pNew = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pNew', 'reference' => '22', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 webhook($cat, $c, $pNew, hash_hmac('sha256', $pNew, $secret));
 check('fixture: order 22 paid by the newer attempt', $orders->orders[22]['order_status_id'] === 2);
 $orders->orders[22]['order_status_id'] = 5; // merchant: Complete
 $before = count($orders->history);
-$pOld = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pOld', 'reference' => '22', 'amount' => 12.5, 'status' => 'paid'], 'at' => 'x']);
+$pOld = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pOld', 'reference' => '22', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $pOld, hash_hmac('sha256', $pOld, $secret));
 check('late payment of the expired attempt -> 200 already paid, order stays Complete, double-payment note added', $r->status() === 200 && $r->getOutput() === 'already paid' && $orders->orders[22]['order_status_id'] === 5
 	&& count($orders->history) === $before + 1 && end($orders->history)['order_status_id'] === 5 && str_contains(end($orders->history)['comment'], 'pOld') && str_contains(end($orders->history)['comment'], 'double payment') && $store->getPayment('pOld')['status'] === 'paid');
 $orders->orders[22]['order_status_id'] = 3; // a processing-list status that is not the configured paid one
 $store->addPayment('pOld2', 22, '12.50', 'USD', str_repeat('j', 32));
 $store->rows['pOld2']['seq'] = 205;
-$pOld2 = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pOld2', 'reference' => '22', 'amount' => 12.5, 'status' => 'paid'], 'at' => 'x']);
+$pOld2 = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pOld2', 'reference' => '22', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $pOld2, hash_hmac('sha256', $pOld2, $secret));
 check('an order in any config_processing_status counts as paid too', $r->getOutput() === 'already paid' && $orders->orders[22]['order_status_id'] === 3 && end($orders->history)['order_status_id'] === 3);
 $c->config->set('config_processing_status', json_encode([2, 3]));
 $store->addPayment('pOld3', 22, '12.50', 'USD', str_repeat('k', 32));
 $store->rows['pOld3']['seq'] = 206;
-$pOld3 = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pOld3', 'reference' => '22', 'amount' => 12.5, 'status' => 'paid'], 'at' => 'x']);
+$pOld3 = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'pOld3', 'reference' => '22', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $pOld3, hash_hmac('sha256', $pOld3, $secret));
 check('...also when the status list arrives as a JSON string', $r->getOutput() === 'already paid' && $orders->orders[22]['order_status_id'] === 3);
 $c->config->set('config_processing_status', [2, 3]);
@@ -772,7 +844,7 @@ $url = returnPage($cat, $c, ['order_id' => 10, 'key' => str_repeat('b', 32)]);
 check('returning again after payment -> success page without touching the order', $url !== null && str_contains($url, 'checkout/success') && count($orders->history) === $historyBefore + 1);
 
 // Webhook after the return page already confirmed -> already paid
-$p10 = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'p10', 'reference' => '10', 'amount' => 12.5, 'status' => 'paid'], 'at' => 'x']);
+$p10 = json_encode(['event' => 'payment.paid', 'data' => ['paymentId' => 'p10', 'reference' => '10', 'amount' => 12.5, 'status' => 'paid', 'currency' => 'USD'], 'at' => 'x']);
 $r = webhook($cat, $c, $p10, hash_hmac('sha256', $p10, $secret));
 check('late webhook after the return page confirmed -> 200 already paid, no extra history', $r->status() === 200 && $r->getOutput() === 'already paid' && count($orders->history) === $historyBefore + 1);
 
